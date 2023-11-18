@@ -1,3 +1,4 @@
+bit = require("bit")
 inspect = require("inspect")
 
 --------------------------
@@ -112,6 +113,32 @@ end
 --------------------------
 -- codegen
 --------------------------
+reg_names = {
+    -- high 15..8   low 7..0
+    "A",            "F",
+    "B",            "C",
+    "D",            "E",
+    "H",            "L",
+    -- full 16bit regs (special case)
+    "SP",           "PC"
+}
+
+local function all_gprs() return 0xFF end
+
+-- register masks tell us about where a value can be placed,
+-- an output mask means where a value will be allocated and
+-- input masks limit where inputs can be allocated.
+local function compute_reg_mask(n)
+    if n.tag == "+" or n.tag == "*" then
+        -- two inputs in any reg
+        return { out=all_gprs(), ins={ all_gprs(), all_gprs() } }
+    elseif n.tag == "num" then
+        return { out=all_gprs() }
+    else
+        error("fuck "..n.tag)
+    end
+end
+
 -- really dumb asm-like printing stuff
 local function codegen(n)
     -- since we have no control flow yet, we'll worry about that later...
@@ -119,6 +146,7 @@ local function codegen(n)
     local values = {}
     local items = {}
 
+    -- simple topological sort
     local function sched(n)
         -- schedule inputs first
         for i,v in ipairs(n.ins) do
@@ -133,13 +161,35 @@ local function codegen(n)
 
     sched(n)
 
-    -- construct local liveness info:
+    -- set of all virtual regs
+    --   { t=number, mask=number where it's a bitset of 8bits }
+    local vregs = {}
+    local unhandled = {}
+
+    -- construct local liveness info (along with virtual regs):
     local gen = {}
     local kill = {}
+    local time = 0
 
     for i,v in ipairs(items) do
+        local vreg = compute_reg_mask(v)
+
+        -- assign virtual register since there's an out reg
+        if vreg.out ~= 0 then
+            -- advance time
+            time = time + 2
+
+            local id = #vregs + 1
+            v.lid = id
+
+            vregs[id] = { t=time, end_t=time, mask=vreg.out }
+            unhandled[#unhandled + 1] = id
+        end
+
         -- GEN means it's used before defined
         for j,input in ipairs(v.ins) do
+            vregs[input.lid].end_t = time
+
             if not kill[input.gvn] then
                 gen[input.gvn] = true
             end
@@ -149,19 +199,46 @@ local function codegen(n)
         kill[v.gvn] = true
     end
 
-    print(inspect(gen))
-    print(inspect(kill))
+    -- sort intervals
+    table.sort(unhandled, function(a,b) return vregs[a].t > vregs[b].t end)
+
+    --------------------------
+    -- linear scan
+    --------------------------
+    local active = {}
+
+    print("time", "end", "id", "mask", "ins")
+    while #unhandled > 0 do
+        local lid = unhandled[#unhandled]
+        local vreg = vregs[lid]
+        unhandled[#unhandled] = nil
+
+        local t = vreg.t
+        local mask = vreg.mask
+        print(vreg.t, vreg.end_t, id, mask, inspect(vreg.ins))
+
+        -- expire intervals
+        for i=1,8 do
+            if active[i] and t > vregs[active[i]].end_t then
+                print(string.format("  expire %s!", reg_names[i]))
+                active[i] = nil
+            end
+        end
+
+        -- allocate free reg (that meets the mask rules)
+        for i=1,8 do
+            if bit.band(mask, bit.lshift(1, i)) and not active[i] then
+                print("  assign ", reg_names[i])
+                active[i] = lid
+                break
+            end
+        end
+    end
 end
 
 --------------------------
--- parsing
+-- lexer
 --------------------------
--- latest definitions
-local defs = {}
-
-local code_i = 1
-local code = {}
-
 local ch_class = { [32] = "ws", [9] = "ws", [10] = "ws" }
 for i=33,126 do ch_class[i] = "sym" end
 for i=48,57  do ch_class[i] = "num" end
@@ -208,6 +285,15 @@ local function lexer(str)
     end
 end
 
+--------------------------
+-- parsing
+--------------------------
+-- latest definitions
+local defs = {}
+
+local code_i = 1
+local code = {}
+
 local function next_tok()
     local t = code[code_i]
     code_i = code_i + 1
@@ -226,7 +312,7 @@ end
 local function parse_atom()
     local token = next_tok()
     if type(token) == "number" then
-        local n = make(uint16, "num", {})
+        local n = make(uint8, "num", {})
         n.imm = token
         return n
     elseif type(token) == "string" then
@@ -257,7 +343,7 @@ local function parse_binop(min_prec)
         local op = next_tok()
         local rhs = parse_binop(prec[op] + 1)
 
-        lhs = make(uint16, op, {lhs, rhs})
+        lhs = make(uint8, op, {lhs, rhs})
     end
 
     return lhs
@@ -302,6 +388,9 @@ local function parse_stmt()
     else   error("bad parse") end
 end
 
+--------------------------
+-- Driving da compiler
+--------------------------
 local source = [[
 y := 16;
 y := 5 + 24 * y;
@@ -311,12 +400,10 @@ for t in lexer(source) do
     code[#code + 1] = t
 end
 
-print("code:")
-
 while code_i < #code do
     parse_stmt()
 end
 
-codegen(defs.y)
-
 print(node_str(defs.y))
+
+codegen(defs.y)
