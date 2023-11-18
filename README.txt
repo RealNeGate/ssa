@@ -1,0 +1,1 @@
+People asked about SoN, i'll be using this to explain some of that stuff while using it to write a small language project.
