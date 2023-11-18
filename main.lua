@@ -102,21 +102,125 @@ local function node_str(n)
 end
 
 --------------------------
+-- optimizer
+--------------------------
+-- peepholes can be applied on the fly which is cool
+local function peep(n)
+    return n
+end
+
+--------------------------
+-- codegen
+--------------------------
+-- really dumb asm-like printing stuff
+local function codegen(n)
+    -- since we have no control flow yet, we'll worry about that later...
+    local visited = { [n] = true }
+    local values = {}
+    local items = {}
+
+    local function sched(n)
+        -- schedule inputs first
+        for i,v in ipairs(n.ins) do
+            if not visited[v] then
+                visited[v] = true
+                sched(v)
+            end
+        end
+
+        items[#items + 1] = n
+    end
+
+    sched(n)
+
+    -- construct local liveness info:
+    local gen = {}
+    local kill = {}
+
+    for i,v in ipairs(items) do
+        -- GEN means it's used before defined
+        for j,input in ipairs(v.ins) do
+            if not kill[input.gvn] then
+                gen[input.gvn] = true
+            end
+        end
+
+        -- KILL means defined before use.
+        kill[v.gvn] = true
+    end
+
+    print(inspect(gen))
+    print(inspect(kill))
+end
+
+--------------------------
 -- parsing
 --------------------------
-local code_i = 1
-local code = {
-    "y", ":=", 4, ";",
-    "y", ":=", 16, "*", "y", ";",
-}
-
 -- latest definitions
 local defs = {}
+
+local code_i = 1
+local code = {}
+
+local ch_class = { [32] = "ws", [9] = "ws", [10] = "ws" }
+for i=33,126 do ch_class[i] = "sym" end
+for i=48,57  do ch_class[i] = "num" end
+for i=65,90  do ch_class[i] = "ident" end
+for i=97,122 do ch_class[i] = "ident" end
+
+local function either(a, b, c) return a == b or a == c end
+local function lexer(str)
+    local i = 1
+    return function()
+        -- skip whitespace
+        while ch_class[str:byte(i)] == "ws" do
+            i = i + 1
+        end
+
+        if i > #str then
+            return nil
+        end
+
+        local start = i
+        local class = ch_class[str:byte(i)]
+        if class == "num" then
+            i = i + 1
+            while ch_class[str:byte(i)] == "num" do
+                i = i + 1
+            end
+            return tonumber(str:sub(start, i - 1))
+        elseif class == "ident" then
+            i = i + 1
+            while either(ch_class[str:byte(i)], "ident", "num") do
+                i = i + 1
+            end
+            return str:sub(start, i - 1)
+        elseif class == "sym" then
+            if str:byte(i) == string.byte(":") and str:byte(i + 1) == string.byte("=") then
+                i = i + 2
+            else
+                i = i + 1
+            end
+            return str:sub(start, i - 1)
+        else
+            error("fuck but in lexing")
+        end
+    end
+end
 
 local function next_tok()
     local t = code[code_i]
     code_i = code_i + 1
     return t
+end
+
+local function eat_tok(str)
+    if code[code_i] == str then
+        code_i = code_i + 1
+        return true
+    end
+
+    return false
 end
 
 local function parse_atom()
@@ -127,7 +231,7 @@ local function parse_atom()
         return n
     elseif type(token) == "string" then
         if not defs[token] then
-            error("no definition "..token)
+            error("no definition of "..token)
         end
 
         return defs[token]
@@ -136,10 +240,6 @@ local function parse_atom()
     end
 end
 
--- EXPR3  ::= SYM | NUMBER
--- EXPR2  ::= EXPR3 (('+'|'-') EXPR3)*
--- EXPR1  ::= EXPR2 (('*'|'/') EXPR2)*
--- EXPR   ::= EXPR1
 prec = {
     ["+"] = 1,
     ["-"] = 1,
@@ -147,13 +247,31 @@ prec = {
     ["/"] = 2,
 }
 
-local function parse_expr(min_prec)
+-- EXPR3  ::= SYM | NUMBER
+-- EXPR2  ::= EXPR3 (('+'|'-') EXPR3)*
+-- EXPR1  ::= EXPR2 (('*'|'/') EXPR2)*
+-- EXPR   ::= EXPR1 ('|' EXPR '|' EXPR1)?
+local function parse_binop(min_prec)
     local lhs = parse_atom()
     while prec[code[code_i]] and prec[code[code_i]] >= min_prec do
         local op = next_tok()
-        local rhs = parse_expr(prec[op] + 1)
+        local rhs = parse_binop(prec[op] + 1)
 
         lhs = make(uint16, op, {lhs, rhs})
+    end
+
+    return lhs
+end
+
+local function parse_expr()
+    local lhs = parse_binop(0)
+    if eat_tok("|") then
+        local mhs = parse_expr()
+        if next_tok() ~= "|" then
+            error("expected semicolon after decl "..code[code_i - 1])
+        end
+
+        local rhs = parse_binop(0)
     end
 
     return lhs
@@ -168,7 +286,7 @@ local function parse_def()
     local name = next_tok()
     next_tok()
 
-    local val = parse_expr(0)
+    local val = parse_expr()
     if next_tok() ~= ";" then
         error("expected semicolon after decl "..code[code_i - 1])
     end
@@ -180,8 +298,17 @@ end
 -- STMT ::= DEF | EXPR ';'
 local function parse_stmt()
     if     parse_def() then
-    elseif parse_expr(0) then
+    elseif parse_expr() then
     else   error("bad parse") end
+end
+
+local source = [[
+y := 16;
+y := 5 + 24 * y;
+]]
+
+for t in lexer(source) do
+    code[#code + 1] = t
 end
 
 print("code:")
@@ -189,5 +316,7 @@ print("code:")
 while code_i < #code do
     parse_stmt()
 end
+
+codegen(defs.y)
 
 print(node_str(defs.y))
